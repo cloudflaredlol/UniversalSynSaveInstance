@@ -450,7 +450,9 @@ def find_decompiler(given: str | None) -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("zip", type=Path, help="the <place>.bytecode.zip written by DumpBytecode")
+    parser.add_argument(
+        "zip", type=Path, help="the <place>.bytecode.zip written by DumpBytecode (or the place file beside it)"
+    )
     parser.add_argument("--place", type=Path, help="the saved place (default: found via the zip's manifest)")
     parser.add_argument("--out", type=Path, help='output path (default: "<place> decompiled.<ext>")')
     parser.add_argument("--decompiler", help="decompiler executable (default: luau-lifter next to this script or on PATH)")
@@ -466,7 +468,17 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        zip_path = args.zip.resolve(strict=True)
+        try:
+            zip_path = args.zip.resolve(strict=True)
+        except OSError as e:
+            raise RebuildError(f"file not found: {args.zip}") from e
+        if zip_path.suffix.lower() != ".zip":
+            # Given the place file instead: use the zip saved beside it
+            if args.place is None:
+                args.place = zip_path
+            zip_path = zip_path.with_name(f"{zip_path.stem}.bytecode.zip")
+            if not zip_path.is_file():
+                raise RebuildError(f"no {zip_path.name} next to {args.place.name}")
         manifest, files = read_dump(zip_path)
         print(f"{len(files)} bytecode files in {zip_path.name}", file=sys.stderr)
 
@@ -480,8 +492,15 @@ def main() -> int:
         if not place_path.is_file():
             raise RebuildError(f"place file not found: {place_path} (pass --place)")
 
-        out_path = args.out or place_path.with_name(f"{place_path.stem} decompiled{place_path.suffix}")
-        out_path = out_path.resolve()
+        if args.out:
+            out_path = args.out.resolve()
+        else:
+            # Never overwrite a previous result: pick the next free "decompiled (n)" name
+            out_path = place_path.with_name(f"{place_path.stem} decompiled{place_path.suffix}")
+            counter = 1
+            while out_path.exists() and not args.force:
+                counter += 1
+                out_path = place_path.with_name(f"{place_path.stem} decompiled ({counter}){place_path.suffix}")
         if out_path in (place_path, zip_path):
             raise RebuildError("the output would overwrite an input file")
         if out_path.exists() and not args.force:
