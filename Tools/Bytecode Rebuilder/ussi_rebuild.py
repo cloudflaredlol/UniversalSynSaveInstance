@@ -177,7 +177,8 @@ def decompile_all(
                 err = proc.stderr.decode("utf-8", "replace").strip() or f"exit code {proc.returncode}"
                 return entry, None, err[:4000]
             if not proc.stdout.strip():
-                return entry, None, "decompiler printed nothing"
+                # Seen both for genuinely empty scripts and for real code the decompiler silently gave up on
+                return entry, None, "decompiler produced no code (the script may be empty, or the decompiler gave up)"
             if len(proc.stdout) > MAX_SOURCE_BYTES:
                 return entry, None, f"output too large ({len(proc.stdout)} bytes)"
             return entry, proc.stdout.replace(b"\r\n", b"\n").rstrip(b"\n"), ""
