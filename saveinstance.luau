@@ -6150,29 +6150,59 @@ local function synsaveinstance(...)
 			local count = #files
 			local base = string.gsub(placename, "%.[^%./\\]+$", "")
 
-			table.insert(files, 1, {
-				name = "manifest.json",
-				data = service.HttpService:JSONEncode({
-					PlaceId = game.PlaceId,
-					PlaceVersion = game.PlaceVersion,
-					PlaceFile = string.match(placename, "[^/\\]+$"),
-					Scripts = DumpedBytecode.scripts,
-				}),
+			local manifestOk, manifest = pcall(service.HttpService.JSONEncode, service.HttpService, {
+				PlaceId = game.PlaceId,
+				PlaceVersion = game.PlaceVersion,
+				PlaceFile = string.match(placename, "[^/\\]+$"),
+				Scripts = DumpedBytecode.scripts,
 			})
+			if manifestOk then
+				table.insert(files, 1, { name = "manifest.json", data = manifest })
+			else
+				warn("[DumpBytecode] Couldn't build manifest.json, saving without it:", manifest)
+			end
 
-			local ok, err = pcall(function()
-				if OPTIONS.DumpBytecodeZip and #files <= 0xFFFF then
-					local zip = run_with_loading("Zipping " .. count .. " Bytecode Files", nil, true, buildZip, files)
-					run_with_loading(
-						"Writing Bytecode Zip",
-						nil,
-						true,
-						writefile,
-						base .. ".bytecode.zip",
-						table.concat(zip)
-					)
-				elseif makefolder then
-					local folder = base .. " bytecode"
+			-- * Large single writefile calls fail on some executors, so append in pieces like AlternativeWritefile
+			local function writeLarge(path, data)
+				local SEGMENT_SIZE = 4145728
+				if appendfile and #data > SEGMENT_SIZE then
+					writefile(path, string.sub(data, 1, SEGMENT_SIZE))
+					for offset = SEGMENT_SIZE + 1, #data, SEGMENT_SIZE do
+						appendfile(path, string.sub(data, offset, offset + SEGMENT_SIZE - 1))
+						task.wait()
+					end
+				else
+					writefile(path, data)
+				end
+				if isfile and not isfile(path) then
+					error("writefile didn't create " .. path)
+				end
+			end
+
+			local saved, lastErr
+			if OPTIONS.DumpBytecodeZip and #files <= 0xFFFF then
+				local zipped, zip =
+					pcall(run_with_loading, "Zipping " .. count .. " Bytecode Files", nil, true, buildZip, files)
+				if zipped then
+					local data = table.concat(zip)
+					-- * Some executors refuse unusual extensions in writefile, so .txt is the fallback
+					for _, path in { base .. ".bytecode.zip", base .. ".bytecode.zip.txt" } do
+						local wrote, err =
+							pcall(run_with_loading, "Writing Bytecode Zip", nil, true, writeLarge, path, data)
+						if wrote then
+							saved = path
+							break
+						end
+						lastErr = err
+					end
+				else
+					lastErr = zip
+				end
+			end
+
+			if not saved and makefolder then
+				local folder = base .. " bytecode"
+				local wrote, err = pcall(function()
 					makefolder(folder)
 					makefolder(folder .. "/bytecode")
 					for i, file in files do
@@ -6181,12 +6211,18 @@ local function synsaveinstance(...)
 							task.wait()
 						end
 					end
+				end)
+				if wrote then
+					saved = folder
 				else
-					error("Too many files to zip and makefolder is unavailable")
+					lastErr = err
 				end
-			end)
-			if not ok then
-				warn("Failed to write bytecode dump", err)
+			end
+
+			if saved then
+				print("[DumpBytecode] Saved " .. count .. " bytecode files to " .. saved)
+			else
+				warn("[DumpBytecode] FAILED to save bytecode:", lastErr)
 			end
 		end
 	end

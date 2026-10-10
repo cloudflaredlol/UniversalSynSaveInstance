@@ -472,13 +472,15 @@ def main() -> int:
             zip_path = args.zip.resolve(strict=True)
         except OSError as e:
             raise RebuildError(f"file not found: {args.zip}") from e
-        if zip_path.suffix.lower() != ".zip":
+        # USSI falls back to ".bytecode.zip.txt" on executors that refuse to write .zip files
+        if not zip_path.name.lower().endswith((".zip", ".zip.txt")):
             # Given the place file instead: use the zip saved beside it
             if args.place is None:
                 args.place = zip_path
-            zip_path = zip_path.with_name(f"{zip_path.stem}.bytecode.zip")
-            if not zip_path.is_file():
-                raise RebuildError(f"no {zip_path.name} next to {args.place.name}")
+            candidates = [zip_path.with_name(f"{zip_path.stem}.bytecode.zip{ext}") for ext in ("", ".txt")]
+            zip_path = next((c for c in candidates if c.is_file()), None)
+            if zip_path is None:
+                raise RebuildError(f"no {candidates[0].name} next to {args.place.name}")
         manifest, files = read_dump(zip_path)
         print(f"{len(files)} bytecode files in {zip_path.name}", file=sys.stderr)
 
