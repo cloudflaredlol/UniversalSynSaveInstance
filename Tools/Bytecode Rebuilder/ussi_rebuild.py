@@ -4,9 +4,10 @@ Takes a place saved with saveinstance's DumpBytecode option, decompiles every sc
 bytecode with a local decompiler, and writes a copy of the place with real source in place
 of each bytecode line. The bytecode is either embedded in the place itself
 (`-- USSI_BYTECODE_BASE64: <bytecode>`, the default) or in a `<place>.bytecode.zip` saved
-beside it (`-- USSI_BYTECODE: <file>`, with DumpBytecodeZip).
+beside it (`-- USSI_BYTECODE: <file>`, with DumpBytecodeZip). "<place>.bytecode.rbxlx"
+is rebuilt as "<place>.rbxlx" next to it.
 
-    python -I ussi_rebuild.py "place 123 Name.rbxlx"
+    python -I ussi_rebuild.py "place 123 Name.bytecode.rbxlx"
     python -I ussi_rebuild.py "place 123 Name.bytecode.zip" --decompiler path/to/luau-lifter.exe
 
 The decompiler is any command that takes a bytecode file path and prints Luau source to
@@ -485,6 +486,29 @@ def verify_xml(rebuilt: bytes) -> int:
 # ---------------------------------------------------------------- main
 
 
+BYTECODE_TAG = ".bytecode"  # USSI names DumpBytecode saves "<place>.bytecode.rbxlx"
+
+
+def strip_bytecode_tag(stem: str) -> str:
+    return stem[: -len(BYTECODE_TAG)] if stem.lower().endswith(BYTECODE_TAG) else stem
+
+
+def default_output(place_path: Path, force: bool) -> Path:
+    """"<place>.bytecode.rbxlx" becomes "<place>.rbxlx"; other names get " decompiled".
+
+    Never overwrites a previous result unless forced: picks the next free "(n)" name instead.
+    """
+    stem, ext = place_path.stem, place_path.suffix
+    base = strip_bytecode_tag(stem)
+    if base == stem:
+        base = f"{stem} decompiled"  # the plain name would be the input itself
+    out_path, counter = place_path.with_name(base + ext), 1
+    while out_path.exists() and not force:
+        counter += 1
+        out_path = place_path.with_name(f"{base} ({counter}){ext}")
+    return out_path
+
+
 def find_decompiler(given: str | None) -> Path:
     candidates = [given] if given else [
         str(Path(__file__).with_name("luau-lifter.exe")),
@@ -505,7 +529,7 @@ def main() -> int:
         "input", type=Path, help="the place saved with DumpBytecode (or the <place>.bytecode.zip beside it)"
     )
     parser.add_argument("--place", type=Path, help="the saved place, when it can't be found from the zip")
-    parser.add_argument("--out", type=Path, help='output path (default: "<place> decompiled.<ext>")')
+    parser.add_argument("--out", type=Path, help='output path (default: "<place>.bytecode.rbxlx" -> "<place>.rbxlx")')
     parser.add_argument("--decompiler", help="decompiler executable (default: luau-lifter next to this script or on PATH)")
     parser.add_argument(
         "--decompiler-args",
@@ -531,7 +555,8 @@ def main() -> int:
             if args.place is None:
                 args.place = given
             # A zip beside the place is optional: the default embeds the bytecode in the place
-            candidates = [given.with_name(f"{given.stem}.bytecode.zip{ext}") for ext in ("", ".txt")]
+            stem = strip_bytecode_tag(given.stem)
+            candidates = [given.with_name(f"{stem}.bytecode.zip{ext}") for ext in ("", ".txt")]
             zip_path = next((c for c in candidates if c.is_file()), None)
 
         manifest, files = read_dump(zip_path) if zip_path else ({}, {})
@@ -551,12 +576,7 @@ def main() -> int:
         if args.out:
             out_path = args.out.resolve()
         else:
-            # Never overwrite a previous result: pick the next free "decompiled (n)" name
-            out_path = place_path.with_name(f"{place_path.stem} decompiled{place_path.suffix}")
-            counter = 1
-            while out_path.exists() and not args.force:
-                counter += 1
-                out_path = place_path.with_name(f"{place_path.stem} decompiled ({counter}){place_path.suffix}")
+            out_path = default_output(place_path, args.force)
         if out_path in (place_path, zip_path):
             raise RebuildError("the output would overwrite an input file")
         if out_path.exists() and not args.force:
