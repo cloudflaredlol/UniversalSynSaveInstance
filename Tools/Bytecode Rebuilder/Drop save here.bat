@@ -1,5 +1,5 @@
 @echo off
-rem Drag a <place>.bytecode.zip (or the place file saved with it) onto this file.
+rem Drag a place saved with DumpBytecode (or its .bytecode.zip) onto this file.
 rem The rebuilt "<place> decompiled" file is written next to it.
 setlocal
 title USSI Bytecode Rebuilder
@@ -19,7 +19,7 @@ shift
 goto next
 
 :usage
-echo Drag a .bytecode.zip (or the .rbxl / .rbxlx saved with it) onto this file.
+echo Drag a .rbxlx / .rbxl saved with DumpBytecode onto this file (or several at once).
 
 :done
 echo.

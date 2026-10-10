@@ -1,16 +1,19 @@
 """Rebuild a USSI place saved with DumpBytecode into a place with real script source.
 
-Takes the `<place>.bytecode.zip` written by saveinstance's DumpBytecode option, decompiles
-every bytecode file with a local decompiler, and writes a copy of the place in which each
-`-- USSI_BYTECODE: <file>` line is replaced by the decompiled source.
+Takes a place saved with saveinstance's DumpBytecode option, decompiles every script's
+bytecode with a local decompiler, and writes a copy of the place with real source in place
+of each bytecode line. The bytecode is either embedded in the place itself
+(`-- USSI_BYTECODE_BASE64: <bytecode>`, the default) or in a `<place>.bytecode.zip` saved
+beside it (`-- USSI_BYTECODE: <file>`, with DumpBytecodeZip).
 
+    python -I ussi_rebuild.py "place 123 Name.rbxlx"
     python -I ussi_rebuild.py "place 123 Name.bytecode.zip" --decompiler path/to/luau-lifter.exe
 
 The decompiler is any command that takes a bytecode file path and prints Luau source to
 stdout; the default arguments match Tovek's / medal's luau-lifter (`<file> -e`).
 
 Safety:
-  * The input place and zip are only read. The output is written to a temporary file,
+  * The input files are only read. The output is written to a temporary file,
     re-read and checked, then renamed into place; an existing output is never overwritten
     unless --force is given.
   * Nothing is extracted from the zip by its own entry names. Names must match the exact
@@ -27,7 +30,10 @@ Needs Python 3.10+. zstd-compressed .rbxl chunks (the USSI default) need Python 
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import concurrent.futures
+import hashlib
 import json
 import os
 import re
@@ -41,8 +47,9 @@ import zipfile
 from pathlib import Path
 from xml.parsers import expat
 
-# The capture stops at anything a USSI file name can't contain (like XML's "]]>" or "<")
-MARKER = re.compile(rb"-- USSI_BYTECODE: ([A-Za-z0-9 _./\\-]*)")
+# Group 1: zip entry name (DumpBytecodeZip). Group 2: embedded base64 bytecode (default).
+# Both captures stop at anything those can't contain (like XML's "]]>" or "<").
+MARKER = re.compile(rb"-- USSI_BYTECODE(?:: ([A-Za-z0-9 _./\\-]*)|_BASE64: ([A-Za-z0-9+/=]*))")
 # Exactly what DumpBytecode writes: bytecode/<n>_<sanitized ClassName Name>.luauc
 VALID_ENTRY = re.compile(r"bytecode/[0-9]{1,9}_[A-Za-z0-9 _]{0,80}\.luauc")
 
@@ -130,10 +137,10 @@ def decompile_all(
     script_names: dict[str, str],
     jobs: int,
     timeout: float,
-) -> tuple[dict[str, bytes], list[str]]:
-    """Returns ({entry: source}, [failed entries]). Failures get a comment instead of source."""
+) -> tuple[dict[str, bytes], set[str]]:
+    """Returns ({key: source}, {failed keys}). Failures get a comment instead of source."""
     results: dict[str, bytes] = {}
-    failed: list[str] = []
+    failed: set[str] = set()
 
     with tempfile.TemporaryDirectory(prefix="ussi_rebuild_") as tmp:
         tmp_dir = Path(tmp)
@@ -180,9 +187,8 @@ def decompile_all(
             for entry, source, err in pool.map(lambda pair: run(*pair), enumerate(entries)):
                 done += 1
                 if source is None:
-                    failed.append(entry)
-                    comment = lua_block_comment(f" USSI rebuild: failed to decompile {entry}\n{err}\n")
-                    source = f"{comment}\n-- USSI_BYTECODE: {entry}".encode()  # kept so a later run can retry
+                    failed.add(entry)
+                    source = lua_block_comment(f" USSI rebuild: failed to decompile {entry}\n{err}\n").encode()
                 results[entry] = source
                 if done % 50 == 0 or done == len(entries):
                     print(f"  decompiled {done}/{len(entries)}", file=sys.stderr)
@@ -190,21 +196,50 @@ def decompile_all(
     return results, failed
 
 
+def embedded_key(encoded: bytes) -> str:
+    return "embedded/" + hashlib.sha256(encoded).hexdigest()[:16] + ".luauc"
+
+
+def collect_embedded(source_texts) -> dict[str, bytes]:
+    """Decodes every embedded bytecode marker once; identical bytecode shares one key."""
+    found: dict[str, bytes] = {}
+    for text in source_texts:
+        for match in MARKER.finditer(text):
+            encoded = match.group(2)
+            if not encoded or len(encoded) > MAX_ENTRY_BYTES * 4 // 3 + 4:
+                continue
+            key = embedded_key(encoded)
+            if key in found:
+                continue
+            try:
+                found[key] = base64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError):
+                print("warning: an embedded bytecode line is corrupt, leaving it as-is", file=sys.stderr)
+    return found
+
+
 class Replacer:
     """Swaps marker lines for decompiled source and counts what happened."""
 
-    def __init__(self, sources: dict[str, bytes]):
+    def __init__(self, sources: dict[str, bytes], failed: set[str]):
         self.sources = sources
+        self.failed = failed
         self.replaced = 0
         self.unresolved: list[str] = []
 
     def lookup(self, match: re.Match) -> bytes | None:
-        name = match.group(1).decode("utf-8", "replace").strip()
-        source = self.sources.get(name) if VALID_ENTRY.fullmatch(name) else None
-        if source is None:
-            self.unresolved.append(name)
+        if match.group(2) is not None:
+            key = embedded_key(match.group(2))
         else:
-            self.replaced += 1
+            name = match.group(1).decode("utf-8", "replace").strip()
+            key = name if VALID_ENTRY.fullmatch(name) else None
+        source = self.sources.get(key) if key else None
+        if source is None:
+            self.unresolved.append(key or "?")
+            return None
+        self.replaced += 1
+        if key in self.failed:
+            return source + b"\n" + match.group(0)  # marker kept so a later run can retry
         return source
 
 
@@ -340,6 +375,13 @@ def source_prop(chunk: Chunk) -> tuple[bytes, list[bytes]] | None:
     return blob[: name_end + 1], values
 
 
+def binary_source_texts(data: bytes):
+    for chunk in parse_binary(data)[1]:
+        prop = source_prop(chunk)
+        if prop:
+            yield from prop[1]
+
+
 def rebuild_binary(data: bytes, replacer: Replacer) -> tuple[bytes, set[int]]:
     header, chunks, trailer = parse_binary(data)
     out, changed = [header], set()
@@ -385,7 +427,7 @@ def verify_binary(original: bytes, rebuilt: bytes, changed: set[int]) -> int:
 
 # ---------------------------------------------------------------- XML (.rbxlx / .rbxmx)
 
-XML_INVALID = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f￾￿]")
+XML_INVALID = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
 # USSI and Studio write ProtectedString; rbx-dom tools (Rojo, Lune) write string
 SOURCE_PROPERTY = re.compile(rb'(<(ProtectedString|string) name="Source">)(.*?)(</\2>)', re.DOTALL)
 
@@ -402,9 +444,18 @@ def xml_text(source: bytes, in_cdata: bool) -> bytes:
     return text.encode("utf-8")
 
 
-def rebuild_xml(data: bytes, replacer: Replacer) -> bytes:
+def check_xml(data: bytes) -> None:
     if re.search(rb"<!DOCTYPE|<!ENTITY", data[:1 << 20]):
         raise RebuildError("XML file contains a DOCTYPE/ENTITY declaration, which USSI never writes")
+
+
+def xml_source_texts(data: bytes):
+    for prop in SOURCE_PROPERTY.finditer(data):
+        yield prop.group(3)
+
+
+def rebuild_xml(data: bytes, replacer: Replacer) -> bytes:
+    check_xml(data)
 
     def fill_property(prop: re.Match) -> bytes:
         body = prop.group(3)
@@ -451,9 +502,9 @@ def find_decompiler(given: str | None) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
-        "zip", type=Path, help="the <place>.bytecode.zip written by DumpBytecode (or the place file beside it)"
+        "input", type=Path, help="the place saved with DumpBytecode (or the <place>.bytecode.zip beside it)"
     )
-    parser.add_argument("--place", type=Path, help="the saved place (default: found via the zip's manifest)")
+    parser.add_argument("--place", type=Path, help="the saved place, when it can't be found from the zip")
     parser.add_argument("--out", type=Path, help='output path (default: "<place> decompiled.<ext>")')
     parser.add_argument("--decompiler", help="decompiler executable (default: luau-lifter next to this script or on PATH)")
     parser.add_argument(
@@ -469,20 +520,23 @@ def main() -> int:
 
     try:
         try:
-            zip_path = args.zip.resolve(strict=True)
+            given = args.input.resolve(strict=True)
         except OSError as e:
-            raise RebuildError(f"file not found: {args.zip}") from e
+            raise RebuildError(f"file not found: {args.input}") from e
+
         # USSI falls back to ".bytecode.zip.txt" on executors that refuse to write .zip files
-        if not zip_path.name.lower().endswith((".zip", ".zip.txt")):
-            # Given the place file instead: use the zip saved beside it
+        if given.name.lower().endswith((".zip", ".zip.txt")):
+            zip_path = given
+        else:
             if args.place is None:
-                args.place = zip_path
-            candidates = [zip_path.with_name(f"{zip_path.stem}.bytecode.zip{ext}") for ext in ("", ".txt")]
+                args.place = given
+            # A zip beside the place is optional: the default embeds the bytecode in the place
+            candidates = [given.with_name(f"{given.stem}.bytecode.zip{ext}") for ext in ("", ".txt")]
             zip_path = next((c for c in candidates if c.is_file()), None)
-            if zip_path is None:
-                raise RebuildError(f"no {candidates[0].name} next to {args.place.name}")
-        manifest, files = read_dump(zip_path)
-        print(f"{len(files)} bytecode files in {zip_path.name}", file=sys.stderr)
+
+        manifest, files = read_dump(zip_path) if zip_path else ({}, {})
+        if zip_path:
+            print(f"{len(files)} bytecode files in {zip_path.name}", file=sys.stderr)
 
         place_path = args.place
         if place_path is None:
@@ -508,6 +562,25 @@ def main() -> int:
         if out_path.exists() and not args.force:
             raise RebuildError(f"{out_path} already exists (pass --force to overwrite)")
 
+        data = place_path.read_bytes()
+        if data[:14] == RBXL_MAGIC:
+            is_binary = True
+            embedded = collect_embedded(binary_source_texts(data))
+        elif data.lstrip()[:1] == b"<":
+            is_binary = False
+            check_xml(data)
+            embedded = collect_embedded(xml_source_texts(data))
+        else:
+            raise RebuildError(f"{place_path.name} is neither a binary nor an XML Roblox file")
+        if embedded:
+            print(f"{len(embedded)} unique scripts embedded in {place_path.name}", file=sys.stderr)
+        files.update(embedded)
+        if not files:
+            raise RebuildError(
+                f"no bytecode found: {place_path.name} has no embedded bytecode and no .bytecode.zip beside it "
+                "(was it saved with DumpBytecode = true?)"
+            )
+
         decompiler = find_decompiler(args.decompiler)
         extra = [a.strip('"') for a in shlex.split(args.decompiler_args, posix=os.name != "nt")]
         if args.unencoded:
@@ -517,16 +590,13 @@ def main() -> int:
 
         sources, failed = decompile_all(files, command, script_names_by_file(manifest), max(1, args.jobs), args.timeout)
 
-        data = place_path.read_bytes()
-        replacer = Replacer(sources)
-        if data[:14] == RBXL_MAGIC:
+        replacer = Replacer(sources, failed)
+        if is_binary:
             rebuilt, changed = rebuild_binary(data, replacer)
             leftover = verify_binary(data, rebuilt, changed)
-        elif data.lstrip()[:1] == b"<":
+        else:
             rebuilt = rebuild_xml(data, replacer)
             leftover = verify_xml(rebuilt)
-        else:
-            raise RebuildError(f"{place_path.name} is neither a binary nor an XML Roblox file")
 
         if leftover < len(replacer.unresolved):  # decompiled code may itself contain marker text
             raise RebuildError("verification failed: marker count mismatch")
@@ -546,7 +616,7 @@ def main() -> int:
     if failed:
         print(f"  failed to decompile: {len(failed)} (left as a comment with the reason)", file=sys.stderr)
     if replacer.unresolved:
-        print(f"  markers left as-is:  {len(replacer.unresolved)} (file missing from the zip)", file=sys.stderr)
+        print(f"  markers left as-is:  {len(replacer.unresolved)} (bytecode missing or corrupt)", file=sys.stderr)
     return 0
 
 

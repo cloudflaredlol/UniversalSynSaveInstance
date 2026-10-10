@@ -3588,8 +3588,8 @@ end
 --- @field BytecodeTimeout number -- If the SaveBytecode run time exceeds this value it gets cancelled. Set to -1 to disable timeout. ___Default:___ 3
 --- @field DecompileJobless boolean -- Includes already decompiled code in the output. No new scripts are decompiled. ___Default:___ false
 --- @field SaveBytecode boolean -- Includes bytecode in the output. Useful if you wish to be able to decompile it yourself later. Respects **@DecompileIgnore**. ___Default:___ false
---- @field DumpBytecode boolean -- Skips decompiling entirely. Each script's Source is replaced with a `-- USSI_BYTECODE: <file>` pointer and its raw bytecode is written beside the place file (`<place>.bytecode.zip`), along with a `manifest.json` mapping script paths to files, so you can decompile it elsewhere later. Identical bytecode is stored once. Respects **@DecompileIgnore**. ___Default:___ false
---- @field DumpBytecodeZip boolean -- Packs the **@DumpBytecode** output into a single uncompressed .zip. If false (or there are more than 65535 files), writes a `<place> bytecode` folder instead. ___Default:___ true
+--- @field DumpBytecode boolean -- Skips decompiling entirely. Each script's Source is replaced with a `-- USSI_BYTECODE_BASE64: <bytecode>` line, so the save stays a single file you can decompile elsewhere later (Tools/Bytecode Rebuilder turns it back into a place with real source). Respects **@DecompileIgnore**. ___Default:___ false
+--- @field DumpBytecodeZip boolean -- With **@DumpBytecode**, writes the bytecode beside the place file instead (`<place>.bytecode.zip`, or `.bytecode.zip.txt` / a `<place> bytecode` folder if the executor refuses), with each Source holding a `-- USSI_BYTECODE: <file>` pointer and a `manifest.json` mapping script paths to files. Identical bytecode is stored once, so the place file is smaller. ___Default:___ false
 --- .DecompileIgnore {Instance | Instance.ClassName | [Instance.ClassName] = {Instance.Name}} -- Ignores matched instances and their descendants by default. To ignore only the instance itself, set the value to `false`. Examples: `"Chat"` matches any instance with ClassName "Chat"; `Players = {"MyPlayerName"}` matches class "Players" AND name "MyPlayerName" only; `workspace` matches a specific instance by reference; `[workspace] = false` matches a specific instance by reference, ignoring only itself and not its descendants. ___Default:___ {TextChatService}
 --- .IgnoreList {Instance | Instance.ClassName | [Instance.ClassName] = {Instance.Name | false}} -- Structure mirrors **@DecompileIgnore**, except `false` means keep the instance but ignore its descendants. Supports both instance references and ClassName strings. Examples: `"CoreGui"` skips entirely; `CorePackages = false` keeps the instance but skips its descendants; `Players = {"SomePlayer"}` skips a specific named instance with specific ClassName. ___Default:___ {CoreGui, CorePackages, Packages = false}
 --- .ExtraInstances {Instance} -- If used with any invalid mode (like "invalidmode") it will only save these instances. ___Default:___ {}
@@ -3706,7 +3706,7 @@ local function synsaveinstance(...)
 		SaveBytecode = false,
 		BytecodeTimeout = 3,
 		DumpBytecode = false,
-		DumpBytecodeZip = true,
+		DumpBytecodeZip = false,
 
 		__DEBUG_MODE = false,
 
@@ -4485,8 +4485,11 @@ local function synsaveinstance(...)
 	local DumpBytecode, DumpedBytecode
 	if OPTIONS.DumpBytecode then
 		if getscriptbytecode then
-			-- * Each unique bytecode is stored once; scripts sharing it point to the same file
-			DumpedBytecode = { files = {}, byBytecode = {}, scripts = {} }
+			local separateZip = OPTIONS.DumpBytecodeZip
+			if separateZip then
+				-- * Each unique bytecode is stored once; scripts sharing it point to the same file
+				DumpedBytecode = { files = {}, byBytecode = {}, scripts = {} }
+			end
 
 			DumpBytecode = function(script)
 				local s, bytecode = getbytecode(script)
@@ -4494,6 +4497,11 @@ local function synsaveinstance(...)
 					return "--[[ Failed to get bytecode. Reason:\n" .. tostring(bytecode) .. "\n]]"
 				elseif not bytecode or bytecode == "" then
 					return "-- The Script is Empty"
+				end
+
+				if not separateZip then
+					-- * Embedded in the place itself so the save stays one file; %s strip guards against line-wrapping encoders
+					return "-- USSI_BYTECODE_BASE64: " .. (string.gsub(base64encode(bytecode), "%s", ""))
 				end
 
 				local file = DumpedBytecode.byBytecode[bytecode]
@@ -6180,7 +6188,7 @@ local function synsaveinstance(...)
 			end
 
 			local saved, lastErr
-			if OPTIONS.DumpBytecodeZip and #files <= 0xFFFF then
+			if #files <= 0xFFFF then
 				local zipped, zip =
 					pcall(run_with_loading, "Zipping " .. count .. " Bytecode Files", nil, true, buildZip, files)
 				if zipped then
