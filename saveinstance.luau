@@ -3588,6 +3588,8 @@ end
 --- @field BytecodeTimeout number -- If the SaveBytecode run time exceeds this value it gets cancelled. Set to -1 to disable timeout. ___Default:___ 3
 --- @field DecompileJobless boolean -- Includes already decompiled code in the output. No new scripts are decompiled. ___Default:___ false
 --- @field SaveBytecode boolean -- Includes bytecode in the output. Useful if you wish to be able to decompile it yourself later. Respects **@DecompileIgnore**. ___Default:___ false
+--- @field DumpBytecode boolean -- Skips decompiling entirely. Each script's Source is replaced with a `-- USSI_BYTECODE: <file>` pointer and its raw bytecode is written beside the place file (`<place>.bytecode.zip`), along with a `manifest.json` mapping script paths to files, so you can decompile it elsewhere later. Identical bytecode is stored once. Respects **@DecompileIgnore**. ___Default:___ false
+--- @field DumpBytecodeZip boolean -- Packs the **@DumpBytecode** output into a single uncompressed .zip. If false (or there are more than 65535 files), writes a `<place> bytecode` folder instead. ___Default:___ true
 --- .DecompileIgnore {Instance | Instance.ClassName | [Instance.ClassName] = {Instance.Name}} -- Ignores matched instances and their descendants by default. To ignore only the instance itself, set the value to `false`. Examples: `"Chat"` matches any instance with ClassName "Chat"; `Players = {"MyPlayerName"}` matches class "Players" AND name "MyPlayerName" only; `workspace` matches a specific instance by reference; `[workspace] = false` matches a specific instance by reference, ignoring only itself and not its descendants. ___Default:___ {TextChatService}
 --- .IgnoreList {Instance | Instance.ClassName | [Instance.ClassName] = {Instance.Name | false}} -- Structure mirrors **@DecompileIgnore**, except `false` means keep the instance but ignore its descendants. Supports both instance references and ClassName strings. Examples: `"CoreGui"` skips entirely; `CorePackages = false` keeps the instance but skips its descendants; `Players = {"SomePlayer"}` skips a specific named instance with specific ClassName. ___Default:___ {CoreGui, CorePackages, Packages = false}
 --- .ExtraInstances {Instance} -- If used with any invalid mode (like "invalidmode") it will only save these instances. ___Default:___ {}
@@ -3703,6 +3705,8 @@ local function synsaveinstance(...)
 		scriptcache = true,
 		SaveBytecode = false,
 		BytecodeTimeout = 3,
+		DumpBytecode = false,
+		DumpBytecodeZip = true,
 
 		__DEBUG_MODE = false,
 
@@ -4478,6 +4482,135 @@ local function synsaveinstance(...)
 		end
 	end
 
+	local DumpBytecode, DumpedBytecode
+	if OPTIONS.DumpBytecode then
+		if getscriptbytecode then
+			-- * Each unique bytecode is stored once; scripts sharing it point to the same file
+			DumpedBytecode = { files = {}, byBytecode = {}, scripts = {} }
+
+			DumpBytecode = function(script)
+				local s, bytecode = getbytecode(script)
+				if not s then
+					return "--[[ Failed to get bytecode. Reason:\n" .. tostring(bytecode) .. "\n]]"
+				elseif not bytecode or bytecode == "" then
+					return "-- The Script is Empty"
+				end
+
+				local file = DumpedBytecode.byBytecode[bytecode]
+				if not file then
+					local files = DumpedBytecode.files
+					file = "bytecode/"
+						.. #files + 1
+						.. "_"
+						.. string.sub(sanitizeFileName(script.ClassName .. " " .. script.Name), 1, 80)
+						.. ".luauc"
+					files[#files + 1] = { name = file, data = bytecode }
+					DumpedBytecode.byBytecode[bytecode] = file
+				end
+
+				table.insert(
+					DumpedBytecode.scripts,
+					{ Path = script:GetFullName(), ClassName = script.ClassName, File = file }
+				)
+
+				return "-- USSI_BYTECODE: " .. file
+			end
+		else
+			warn("DumpBytecode needs getscriptbytecode, which your executor doesn't have. Decompiling instead")
+		end
+	end
+
+	local crc32Table
+	local function crc32(str)
+		if not crc32Table then
+			crc32Table = {}
+			for i = 0, 255 do
+				local c = i
+				for _ = 1, 8 do
+					if bit32.btest(c, 1) then
+						c = bit32.bxor(0xEDB88320, bit32.rshift(c, 1))
+					else
+						c = bit32.rshift(c, 1)
+					end
+				end
+				crc32Table[i] = c
+			end
+		end
+
+		local b = buffer.fromstring(str)
+		local len = buffer.len(b)
+		local crc = 0xFFFFFFFF
+		for blockStart = 0, len - 1, 0x100000 do
+			for i = blockStart, math.min(blockStart + 0x100000, len) - 1 do
+				crc =
+					bit32.bxor(crc32Table[bit32.band(bit32.bxor(crc, buffer.readu8(b, i)), 0xFF)], bit32.rshift(crc, 8))
+			end
+			task.wait()
+		end
+		return bit32.bxor(crc, 0xFFFFFFFF)
+	end
+
+	-- * Minimal uncompressed (STORE) zip writer; output opens with any unzip tool
+	local function buildZip(files)
+		local now = os.date("*t")
+		local dosTime = bit32.bor(bit32.lshift(now.hour, 11), bit32.lshift(now.min, 5), now.sec // 2)
+		local dosDate = bit32.bor(bit32.lshift(now.year - 1980, 9), bit32.lshift(now.month, 5), now.day)
+		local UTF8_FLAG = 0x0800
+
+		local parts, central, offset = {}, {}, 0
+		for _, file in files do
+			local name, data = file.name, file.data
+			local crc = crc32(data)
+
+			local header = string.pack(
+				"<I4I2I2I2I2I2I4I4I4I2I2",
+				0x04034B50,
+				20,
+				UTF8_FLAG,
+				0,
+				dosTime,
+				dosDate,
+				crc,
+				#data,
+				#data,
+				#name,
+				0
+			)
+			parts[#parts + 1] = header
+			parts[#parts + 1] = name
+			parts[#parts + 1] = data
+
+			central[#central + 1] = string.pack(
+				"<I4I2I2I2I2I2I2I4I4I4I2I2I2I2I2I4I4",
+				0x02014B50,
+				20,
+				20,
+				UTF8_FLAG,
+				0,
+				dosTime,
+				dosDate,
+				crc,
+				#data,
+				#data,
+				#name,
+				0,
+				0,
+				0,
+				0,
+				0,
+				offset
+			) .. name
+
+			offset += #header + #name + #data
+		end
+
+		local centralData = table.concat(central)
+		parts[#parts + 1] = centralData
+		parts[#parts + 1] = string.pack("<I4I2I2I2I2I4I4I2", 0x06054B50, 0, 0, #files, #files, #centralData, offset, 0)
+
+		return parts
+	end
+
 	if not OPTIONS.Decompile then
 		ldecompile = function()
 			return "-- Decompiling is disabled"
@@ -4619,6 +4752,8 @@ local function synsaveinstance(...)
 				or not isLocalScript and instance:IsA("Script") and instance.RunContext ~= Enum.RunContext.Client
 			then
 				value = "-- [FilteringEnabled] Server Scripts are IMPOSSIBLE to save" -- TODO: Could be not just server scripts in the future
+			elseif DumpBytecode then
+				value = DumpBytecode(instance)
 			else
 				value = ldecompile(instance)
 				if SaveBytecode then
@@ -6008,6 +6143,51 @@ local function synsaveinstance(...)
 				placename,
 				table.concat(chunks)
 			)
+		end
+
+		if DumpedBytecode and writefile then
+			local files = DumpedBytecode.files
+			local count = #files
+			local base = string.gsub(placename, "%.[^%./\\]+$", "")
+
+			table.insert(files, 1, {
+				name = "manifest.json",
+				data = service.HttpService:JSONEncode({
+					PlaceId = game.PlaceId,
+					PlaceVersion = game.PlaceVersion,
+					PlaceFile = string.match(placename, "[^/\\]+$"),
+					Scripts = DumpedBytecode.scripts,
+				}),
+			})
+
+			local ok, err = pcall(function()
+				if OPTIONS.DumpBytecodeZip and #files <= 0xFFFF then
+					local zip = run_with_loading("Zipping " .. count .. " Bytecode Files", nil, true, buildZip, files)
+					run_with_loading(
+						"Writing Bytecode Zip",
+						nil,
+						true,
+						writefile,
+						base .. ".bytecode.zip",
+						table.concat(zip)
+					)
+				elseif makefolder then
+					local folder = base .. " bytecode"
+					makefolder(folder)
+					makefolder(folder .. "/bytecode")
+					for i, file in files do
+						writefile(folder .. "/" .. file.name, file.data)
+						if i % 50 == 0 then
+							task.wait()
+						end
+					end
+				else
+					error("Too many files to zip and makefolder is unavailable")
+				end
+			end)
+			if not ok then
+				warn("Failed to write bytecode dump", err)
+			end
 		end
 	end
 
