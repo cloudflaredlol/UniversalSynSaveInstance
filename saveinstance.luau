@@ -3588,7 +3588,7 @@ end
 --- @field BytecodeTimeout number -- If the SaveBytecode run time exceeds this value it gets cancelled. Set to -1 to disable timeout. ___Default:___ 3
 --- @field DecompileJobless boolean -- Includes already decompiled code in the output. No new scripts are decompiled. ___Default:___ false
 --- @field SaveBytecode boolean -- Includes bytecode in the output. Useful if you wish to be able to decompile it yourself later. Respects **@DecompileIgnore**. ___Default:___ false
---- @field DumpBytecode boolean -- Skips decompiling entirely. Each script's Source is replaced with a `-- USSI_BYTECODE_BASE64: <bytecode>` line, so the save stays a single file (named `<place>.bytecode.rbxlx` unless **@FilePath** is set) you can decompile elsewhere later; Tools/Bytecode Rebuilder turns it back into `<place>.rbxlx` with real source. Respects **@DecompileIgnore**. ___Default:___ false
+--- @field DumpBytecode boolean -- Skips decompiling entirely. Each script's Source is replaced with a `-- USSI_BYTECODE_BASE64: <bytecode>` line, so the save stays a single file (named `<place>.bytecode.rbxlx` unless **@FilePath** is set) you can decompile elsewhere later; the separate Bytecode Rebuilder tool turns it back into `<place>.rbxlx` with real source. Respects **@DecompileIgnore**. ___Default:___ false
 --- @field DumpBytecodeZip boolean -- With **@DumpBytecode**, writes the bytecode beside the place file instead (`<place>.bytecode.zip`, or `.bytecode.zip.txt` / a `<place> bytecode` folder if the executor refuses), with each Source holding a `-- USSI_BYTECODE: <file>` pointer and a `manifest.json` mapping script paths to files. Identical bytecode is stored once, so the place file is smaller. ___Default:___ false
 --- .DecompileIgnore {Instance | Instance.ClassName | [Instance.ClassName] = {Instance.Name}} -- Ignores matched instances and their descendants by default. To ignore only the instance itself, set the value to `false`. Examples: `"Chat"` matches any instance with ClassName "Chat"; `Players = {"MyPlayerName"}` matches class "Players" AND name "MyPlayerName" only; `workspace` matches a specific instance by reference; `[workspace] = false` matches a specific instance by reference, ignoring only itself and not its descendants. ___Default:___ {TextChatService}
 --- .IgnoreList {Instance | Instance.ClassName | [Instance.ClassName] = {Instance.Name | false}} -- Structure mirrors **@DecompileIgnore**, except `false` means keep the instance but ignore its descendants. Supports both instance references and ClassName strings. Examples: `"CoreGui"` skips entirely; `CorePackages = false` keeps the instance but skips its descendants; `Players = {"SomePlayer"}` skips a specific named instance with specific ClassName. ___Default:___ {CoreGui, CorePackages, Packages = false}
@@ -4185,7 +4185,7 @@ local function synsaveinstance(...)
 			end
 		end
 
-		-- * Marks saves that still need Tools/Bytecode Rebuilder, e.g. "place 123 Name.bytecode.rbxlx"
+		-- * Marks saves that still need the Bytecode Rebuilder tool, e.g. "place 123 Name.bytecode.rbxlx"
 		local autotype = OPTIONS.DumpBytecode and getscriptbytecode and ".bytecode" .. filetype or filetype
 
 		if FilePath then
