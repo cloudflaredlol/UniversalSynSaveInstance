@@ -1,0 +1,237 @@
+# Tovek patch adding --partial, applied to Kiet1308/Tovek commit c8425be254f5693da9f4f8796fa7dacb60aa76bd
+# Build: git apply tovek-partial.patch && cargo build --release --locked -p luau-lifter --bin luau-lifter
+diff --git a/ast/src/simplify_gotos.rs b/ast/src/simplify_gotos.rs
+index 14f0f2c..68a0f8d 100644
+--- a/ast/src/simplify_gotos.rs
++++ b/ast/src/simplify_gotos.rs
+@@ -2244,6 +2244,75 @@ pub fn function_tree_has_residual_control(block: &Block) -> bool {
+     tree_block_has_residual(block, &mut FxHashSet::default())
+ }
+ 
++/// Partial-output fallback for a chunk that fails `function_tree_has_residual_control`:
++/// replaces the body of every nested function whose *own* statements still hold
++/// internal control flow with `stub()`, so the rest of the chunk can be emitted as
++/// valid Luau. `stub` receives the unstructured body it replaces. Nested closures
++/// are judged separately, so a good closure inside a good function survives a bad
++/// sibling. The root block is never stubbed; callers must re-check it. Returns how
++/// many functions were stubbed.
++pub fn stub_functions_with_residual_control(block: &Block, stub: &dyn Fn(&Block) -> Block) -> usize {
++    fn own_residual(block: &Block) -> bool {
++        block.0.iter().any(|statement| match statement {
++            Statement::Goto(_)
++            | Statement::Label(_)
++            | Statement::NumForInit(_)
++            | Statement::NumForNext(_)
++            | Statement::GenericForInit(_)
++            | Statement::GenericForNext(_) => true,
++            Statement::If(node) => own_residual(&node.then_block.lock()) || own_residual(&node.else_block.lock()),
++            Statement::While(node) => own_residual(&node.block.lock()),
++            Statement::Repeat(node) => own_residual(&node.block.lock()),
++            Statement::NumericFor(node) => own_residual(&node.block.lock()),
++            Statement::GenericFor(node) => own_residual(&node.block.lock()),
++            _ => false,
++        })
++    }
++
++    fn walk_value(value: &RValue, stub: &dyn Fn(&Block) -> Block, visited: &mut FxHashSet<usize>, stubbed: &mut usize) {
++        if let RValue::Closure(closure) = value {
++            let address = Arc::as_ptr(&closure.function.0) as usize;
++            if visited.insert(address) {
++                let mut function = closure.function.lock();
++                walk_block(&function.body, stub, visited, stubbed);
++                if own_residual(&function.body) {
++                    function.body = stub(&function.body);
++                    *stubbed += 1;
++                }
++            }
++            return;
++        }
++        value.visit_rvalues(&mut |child| {
++            walk_value(child, stub, visited, stubbed);
++            true
++        });
++    }
++
++    fn walk_block(block: &Block, stub: &dyn Fn(&Block) -> Block, visited: &mut FxHashSet<usize>, stubbed: &mut usize) {
++        for statement in &block.0 {
++            crate::deinline::visit_stmt_rvalues(statement, &mut |value| {
++                walk_value(value, stub, visited, stubbed);
++                true
++            });
++            match statement {
++                Statement::If(node) => {
++                    walk_block(&node.then_block.lock(), stub, visited, stubbed);
++                    walk_block(&node.else_block.lock(), stub, visited, stubbed);
++                }
++                Statement::While(node) => walk_block(&node.block.lock(), stub, visited, stubbed),
++                Statement::Repeat(node) => walk_block(&node.block.lock(), stub, visited, stubbed),
++                Statement::NumericFor(node) => walk_block(&node.block.lock(), stub, visited, stubbed),
++                Statement::GenericFor(node) => walk_block(&node.block.lock(), stub, visited, stubbed),
++                _ => {}
++            }
++        }
++    }
++
++    let mut stubbed = 0;
++    walk_block(block, stub, &mut FxHashSet::default(), &mut stubbed);
++    stubbed
++}
++
+ /// Post-`LocalDeclarer` fixup: in any block that still contains a `goto`, move
+ /// the block's `local` declarations to the top. This prevents the remaining
+ /// (valid) gotos from jumping *into* the scope of a local declared between the
+diff --git a/luau-lifter/src/lib.rs b/luau-lifter/src/lib.rs
+index 5e35506..781c4f6 100644
+--- a/luau-lifter/src/lib.rs
++++ b/luau-lifter/src/lib.rs
+@@ -709,7 +709,7 @@ fn decompile_bytecode_internal(
+                             // functions are joined, so this item is reported as
+                             // a real decompile failure instead of silently
+                             // dropping its code.
+-                            body.body.extend(unsupported_structuring_sentinel().0);
++                            body.body.extend(unsupported_structuring_sentinel_because("the function's decompiler panicked").0);
+                             drop(body);
+                             (
+                                 ByAddress(ast_function),
+@@ -1006,6 +1006,14 @@ fn decompile_bytecode_internal(
+             // as a hard chunk-level invariant (including every nested closure): a
+             // future unsupported CFG shape must be reported as a decompile error,
+             // never silently returned as invalid Luau.
++            // `--partial` (opt-in): stub only the nested functions that can't be
++            // structured, keeping the invariant above for everything emitted.
++            if PARTIAL_OUTPUT.load(std::sync::atomic::Ordering::Relaxed)
++                && ast::simplify_gotos::function_tree_has_residual_control(&body)
++            {
++                let stubbed = ast::simplify_gotos::stub_functions_with_residual_control(&body, &partial_stub);
++                PARTIAL_STUBBED_FUNCTIONS.fetch_add(stubbed, std::sync::atomic::Ordering::Relaxed);
++            }
+             if ast::simplify_gotos::function_tree_has_residual_control(&body) {
+                 if function_diagnostics.is_empty() {
+                     function_diagnostics.push(DecompileDiagnostic {
+@@ -1524,6 +1532,41 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+ /// safe.  The marker is deliberately an invalid internal AST construct; the
+ /// final invariant in [`decompile_function`] detects it before output is
+ /// returned, so callers cannot mistake a failed function for an empty body.
++/// Opt-in partial output (CLI `--partial`): a nested function that can't be
++/// structured into valid Luau is replaced by [`partial_stub`] instead of failing
++/// the whole chunk. The root function is never stubbed, so a chunk whose main
++/// body is the problem still fails. Process-global because only the CLI sets it.
++pub static PARTIAL_OUTPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++/// How many functions `--partial` stubbed, for the CLI to report.
++pub static PARTIAL_STUBBED_FUNCTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++
++/// The stub says why the function failed. When structuring got far enough to
++/// leave a goto-form body, that body is kept as comments: it can't run (Luau has
++/// no `goto`), but it still shows what the function does.
++fn partial_stub(unstructured: &ast::Block) -> ast::Block {
++    let text = unstructured.to_string();
++    let mut lines = vec![
++        "Tovek --partial: this function could not be decompiled into valid Luau.".to_string(),
++    ];
++    if text.contains("control-flow structuring failed: unsupported certified fallback") {
++        // A failure sentinel: nothing was structured, so only the reason is useful
++        let reason = text.lines().find_map(|line| line.trim().strip_prefix("-- reason: "));
++        lines.push(format!("Reason: {}", reason.unwrap_or("unsupported control flow")));
++    } else {
++        lines.push("Reason: control flow Luau can't express without goto. Its logic, for reading only:".to_string());
++        lines.extend(text.lines().map(|line| format!("  {line}")));
++    }
++    ast::Block::from(lines.into_iter().map(|line| ast::Comment::new(line).into()).collect::<Vec<_>>())
++}
++
++/// [`unsupported_structuring_sentinel`] plus a comment naming why, which
++/// `--partial` stubs show in place of the function.
++fn unsupported_structuring_sentinel_because(reason: &str) -> ast::Block {
++    let mut block = unsupported_structuring_sentinel();
++    block.0.insert(1, ast::Comment::new(format!("reason: {reason}")).into());
++    block
++}
++
+ fn unsupported_structuring_sentinel() -> ast::Block {
+     let sentinel = ast::RcLocal::default();
+     ast::Block::from(vec![
+@@ -2073,7 +2116,7 @@ fn decompile_function(
+     };
+     if !cleanup_ssa::<true>(&mut function, &local_to_group, &mut cells, &incoming_upvalue_ids, rounds_left)
+     {
+-        ast_function.lock().body = unsupported_structuring_sentinel();
++        ast_function.lock().body = unsupported_structuring_sentinel_because("CFG simplification exceeded its iteration budget");
+         return (ByAddress(ast_function), upvalues_in, Some(DecompileDiagnostic {
+             stage: "ssa_cleanup".into(), code: "rewrite_budget_exhausted".into(),
+             function: function_identity, message: "CFG simplification exceeded its size-derived iteration budget".into(),
+@@ -2190,7 +2233,12 @@ fn decompile_function(
+                 let locals_to_ignore = upvalues_in.iter().chain(params.iter()).cloned().collect();
+                 let block =
+                     certified_fallback_for_policy(function, &locals_to_ignore, control_flow_policy)
+-                        .unwrap_or_else(unsupported_structuring_sentinel);
++                        .unwrap_or_else(|| {
++                            unsupported_structuring_sentinel_because(&format!(
++                                "{}, and the certified fallback declined",
++                                rejection_description.1
++                            ))
++                        });
+                 (block, false, Some(rejection_description))
+             }
+         }
+@@ -2233,17 +2281,23 @@ fn decompile_function(
+             .or_else(|| fallback_source.take().map(|function| function.deep_clone()));
+         if control_flow_policy == ControlFlowOutputPolicy::StrictNoSyntheticControl || took_terminal_block {
+             debug_assert!(!took_terminal_block, "a straight-line block has no residual control flow");
+-            lifted = unsupported_structuring_sentinel();
++            lifted = unsupported_structuring_sentinel_because("strict policy or terminal block");
+         } else if let Some(fallback) = fallback_function.and_then(|function| {
+             used_certified_dispatcher = true;
+             certified_fallback_for_policy(function, &locals_to_ignore, control_flow_policy)
+         }) {
+             lifted = fallback;
++        } else if PARTIAL_OUTPUT.load(std::sync::atomic::Ordering::Relaxed) {
++            // `--partial` keeps the goto-form block: its residual control makes
++            // the chunk-level pass replace it with a comment-only stub that shows
++            // this (by then named) logic, so it is never emitted as code.
++            // Same id re-base as below: the declined attempt minted ids too.
++            ast::set_local_id_base(source_like_end_id.max(ast::current_local_id()));
+         } else {
+             // Never retain a partially structured block when the certified
+             // fallback declines the graph. An unlowered marker makes the final
+             // invariant fail closed instead of silently changing the program.
+-            lifted = unsupported_structuring_sentinel();
++            lifted = unsupported_structuring_sentinel_because("the certified fallback declined this control-flow graph");
+             // Keep the allocator above every id minted by either speculative
+             // attempt so later cleanup passes cannot alias one of its locals.
+             ast::set_local_id_base(source_like_end_id.max(ast::current_local_id()));
+@@ -2256,7 +2310,7 @@ fn decompile_function(
+         // pass happens to simplify the dispatcher into ordinary loops.  The
+         // caller asked for proof that no synthetic control was needed, and
+         // this function did not have that proof at the structuring boundary.
+-        lifted = unsupported_structuring_sentinel();
++        lifted = unsupported_structuring_sentinel_because("strict policy rejected the certified dispatcher");
+     }
+     {
+         ptime!(F_FLATTEN_GUARDS);
+diff --git a/luau-lifter/src/main.rs b/luau-lifter/src/main.rs
+index 1c0c361..71cbb80 100644
+--- a/luau-lifter/src/main.rs
++++ b/luau-lifter/src/main.rs
+@@ -372,6 +372,7 @@ fn run_single_file() {
+             "--no-synth-helpers" => options.no_synth_helpers = true,
+             "--assume-no-nan" => options.assume_no_nan = true,
+             "--assume-standard-libraries" => options.assume_standard_libraries = true,
++            "--partial" => luau_lifter::PARTIAL_OUTPUT.store(true, std::sync::atomic::Ordering::Relaxed),
+             "--synthesize-arithmetic-loops" => options.synthesize_arithmetic_loops = true,
+             "--allow-certified-dispatcher" => {
+                 options.control_flow_policy =
+@@ -406,7 +407,13 @@ fn run_single_file() {
+         script_name.as_deref(),
+         options,
+     ) {
+-        Ok(source) => println!("{source}"),
++        Ok(source) => {
++            println!("{source}");
++            let stubbed = luau_lifter::PARTIAL_STUBBED_FUNCTIONS.load(std::sync::atomic::Ordering::Relaxed);
++            if stubbed > 0 {
++                eprintln!("partial: {stubbed} function(s) could not be decompiled and were stubbed");
++            }
++        }
+         Err(err) => {
+             eprintln!("{err}");
+             finish(1);

@@ -138,15 +138,33 @@ def decompile_all(
     script_names: dict[str, str],
     jobs: int,
     timeout: float,
-) -> tuple[dict[str, bytes], set[str]]:
-    """Returns ({key: source}, {failed keys}). Failures get a comment instead of source."""
+) -> tuple[dict[str, bytes], dict[str, str]]:
+    """Returns ({key: source}, {key: outcome}) where outcome is "ok", "partial", "empty" or
+    "failed". Failures get a comment with the reason instead of source."""
     results: dict[str, bytes] = {}
-    failed: set[str] = set()
+    outcomes: dict[str, str] = {}
 
     with tempfile.TemporaryDirectory(prefix="ussi_rebuild_") as tmp:
         tmp_dir = Path(tmp)
 
-        def run(index: int, entry: str) -> tuple[str, bytes | None, str]:
+        def decompile_once(args: list[str]) -> tuple[int, bytes, str]:
+            try:
+                proc = subprocess.run(
+                    args,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    timeout=timeout,
+                    shell=False,
+                    cwd=tmp_dir,
+                )
+            except subprocess.TimeoutExpired:
+                return -1, b"", f"timed out after {timeout:g}s"
+            except OSError as e:
+                return -1, b"", f"could not start decompiler: {e}"
+            err = proc.stderr.decode("utf-8", "replace").strip() or f"exit code {proc.returncode}"
+            return proc.returncode, proc.stdout, err[:4000]
+
+        def run(index: int, entry: str) -> tuple[str, bytes | None, str, str]:
             bytecode_path = tmp_dir / f"{index}.luauc"
             bytecode_path.write_bytes(files[entry])
             args = [part.replace("{file}", str(bytecode_path)) for part in command]
@@ -158,44 +176,46 @@ def decompile_all(
                 clean = re.sub(r"[\x00-\x1f\x7f]", "", name)[:500]
                 args = [part.replace("{name}", clean) for part in args]
             try:
-                proc = subprocess.run(
-                    args,
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    timeout=timeout,
-                    shell=False,
-                    cwd=tmp_dir,
-                )
-            except subprocess.TimeoutExpired:
-                return entry, None, f"timed out after {timeout:g}s"
-            except OSError as e:
-                return entry, None, f"could not start decompiler: {e}"
+                code, stdout, err = decompile_once(args)
+                outcome = "ok"
+                if code > 0 and "--partial" not in args:
+                    # Tovek's --partial (USSI patch) stubs only the functions it can't structure.
+                    # A decompiler without it rejects the flag, and the first error is kept.
+                    retry_code, retry_stdout, _ = decompile_once([*args, "--partial"])
+                    if retry_code == 0 and retry_stdout.strip():
+                        code, stdout, outcome = 0, retry_stdout, "partial"
             finally:
                 bytecode_path.unlink(missing_ok=True)
 
-            if proc.returncode != 0:
-                err = proc.stderr.decode("utf-8", "replace").strip() or f"exit code {proc.returncode}"
-                return entry, None, err[:4000]
-            if not proc.stdout.strip():
-                # Seen both for genuinely empty scripts and for real code the decompiler silently gave up on
-                return entry, None, "decompiler produced no code (the script may be empty, or the decompiler gave up)"
-            if len(proc.stdout) > MAX_SOURCE_BYTES:
-                return entry, None, f"output too large ({len(proc.stdout)} bytes)"
-            return entry, proc.stdout.replace(b"\r\n", b"\n").rstrip(b"\n"), ""
+            if code != 0:
+                return entry, None, err, "failed"
+            if not stdout.strip():
+                # Tovek prints nothing when the script's top level is empty or just returns
+                # (e.g. "do return end" disabling it); any functions in it are unreachable
+                return entry, b"-- USSI rebuild: this script does nothing (its top level is empty or returns immediately)", "", "empty"
+            if len(stdout) > MAX_SOURCE_BYTES:
+                return entry, None, f"output too large ({len(stdout)} bytes)", "failed"
+            source = stdout.replace(b"\r\n", b"\n").rstrip(b"\n")
+            if outcome == "partial":
+                source = (
+                    b"-- USSI rebuild: partially decompiled. Functions that could not be decompiled are stubbed;\n"
+                    b'-- search for "Tovek --partial". The original bytecode is kept at the bottom.\n\n' + source
+                )
+            return entry, source, "", outcome
 
         entries = sorted(files)
         done = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
-            for entry, source, err in pool.map(lambda pair: run(*pair), enumerate(entries)):
+            for entry, source, err, outcome in pool.map(lambda pair: run(*pair), enumerate(entries)):
                 done += 1
                 if source is None:
-                    failed.add(entry)
                     source = lua_block_comment(f" USSI rebuild: failed to decompile {entry}\n{err}\n").encode()
                 results[entry] = source
+                outcomes[entry] = outcome
                 if done % 50 == 0 or done == len(entries):
                     print(f"  decompiled {done}/{len(entries)}", file=sys.stderr)
 
-    return results, failed
+    return results, outcomes
 
 
 def embedded_key(encoded: bytes) -> str:
@@ -609,9 +629,12 @@ def main() -> int:
         command = [str(decompiler), *extra]
         print(f"decompiling with {decompiler.name} ({args.jobs} at a time)", file=sys.stderr)
 
-        sources, failed = decompile_all(files, command, script_names_by_file(manifest), max(1, args.jobs), args.timeout)
+        sources, outcomes = decompile_all(files, command, script_names_by_file(manifest), max(1, args.jobs), args.timeout)
+        counts = {outcome: list(outcomes.values()).count(outcome) for outcome in ("partial", "empty", "failed")}
+        # Bytecode stays in the output for anything not fully decompiled, so a later run can retry
+        keep_marker = {key for key, outcome in outcomes.items() if outcome in ("partial", "failed")}
 
-        replacer = Replacer(sources, failed)
+        replacer = Replacer(sources, keep_marker)
         if is_binary:
             rebuilt, changed = rebuild_binary(data, replacer)
             leftover = verify_binary(data, rebuilt, changed)
@@ -634,8 +657,12 @@ def main() -> int:
 
     print(f"\nwrote {out_path}", file=sys.stderr)
     print(f"  markers replaced:    {replacer.replaced}", file=sys.stderr)
-    if failed:
-        print(f"  failed to decompile: {len(failed)} (left as a comment with the reason)", file=sys.stderr)
+    if counts["partial"]:
+        print(f"  partially decompiled: {counts['partial']} (unsupported functions stubbed)", file=sys.stderr)
+    if counts["empty"]:
+        print(f"  empty scripts:        {counts['empty']} (they do nothing)", file=sys.stderr)
+    if counts["failed"]:
+        print(f"  failed to decompile:  {counts['failed']} (left as a comment with the reason)", file=sys.stderr)
     if replacer.unresolved:
         print(f"  markers left as-is:  {len(replacer.unresolved)} (bytecode missing or corrupt)", file=sys.stderr)
     return 0
