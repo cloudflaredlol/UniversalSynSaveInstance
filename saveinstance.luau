@@ -3625,6 +3625,7 @@ end
 --- @field AntiIdle boolean -- Stop Roblox from kicking you for being idle (not moving) for 20 minutes. ___Default:___ true
 --- @field CopyToClipboard boolean -- Copy the result to the clipboard (the copy/paste buffer) instead of writing a file. Your executor must support `setrbxclipboard`. Use this only for small saves. ___Default:___ false
 --- @field Callback ((data: string, chunks: {string}) -> ()) | false -- Call this function with the result instead of writing a file. It receives the full text and a list of chunks. If `CopyToClipboard` is also on, the clipboard is used instead. ___Default:___ false
+--- @field BeforeSave (() -> ()) | false -- Run after initialization and KillAllScripts, immediately before collecting the snapshot. Use this to prepare output state or restart an executor heartbeat after game threads have been stopped. Errors abort the save. ___Default:___ false
 --- @field IgnoreProperties {string} -- A list of property names to skip on every object. For example: `{"Tags", "AttributesSerialize"}`. ___Default:___ {}
 --- @field IgnoreNotArchivable boolean -- Save objects even when their `Archivable` property is `false`. If this is off, the script skips those objects. ___Default:___ true
 --- @field SaveNotCreatable boolean -- Save classes that Roblox says are not creatable. The script replaces them with a class it can create, using `NotCreatableFixes` (usually `Folder`). This turns on automatically with `IsolatePlayers`, `IsolateLocalPlayer`, and `NilInstances` (when `getnilinstances` exists). ___Default:___ false
@@ -3740,6 +3741,7 @@ local function synsaveinstance(...)
 		__DEBUG_MODE = false,
 
 		Callback = false,
+		BeforeSave = false,
 		CopyToClipboard = false, -- Description: If set to true, the serialized data will be set to the clipboard, which can be later pasted into studio easily.
 
 		DecompileIgnore = {
@@ -7094,7 +7096,12 @@ local function synsaveinstance(...)
 
 	elapse_t = os.clock()
 
-	local ok, err = xpcall(save_game, function(err)
+	local ok, err = xpcall(function()
+		if OPTIONS.BeforeSave then
+			OPTIONS.BeforeSave()
+		end
+		save_game()
+	end, function(err)
 		return debug.traceback(err)
 	end)
 
@@ -7148,6 +7155,10 @@ local function synsaveinstance(...)
 		task.wait(Log10 * 2 + ExtraTime)
 		game:Shutdown()
 	end
+
+	-- Existing callers can ignore these values; automated callers must not hand
+	-- a previous file to their uploader after initialization or writing fails.
+	return ok, err
 end
 
 return synsaveinstance

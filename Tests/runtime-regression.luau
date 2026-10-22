@@ -82,4 +82,47 @@ return function()
 end
 ]]))()
 dump()
-print("PASS: merged syntax, public Tags fallback, override/error handling, bytecode routing, ZIP deduplication")
+
+local quiesce = section("if OPTIONS.KillAllScripts and not USSI.KillAllScripts then", "\n\tif IsolateStarterPlayer then")
+local capture = section("local ok, err = xpcall(function()", "\n\tif OPTIONS.BoostFPS then")
+local snapshot = assert(loadstring([[
+return function(mode)
+    local gameThread = coroutine.create(function() end)
+    local oldHeartbeat = coroutine.create(function() end)
+    local newHeartbeat
+    local ownFunction, gameFunction = function() end, function() end
+    local hooked = false
+    local self = coroutine.running()
+    local OPTIONS, USSI = {KillAllScripts = true}, {}
+    local SaveCacheInterval = 0x1600 * 10
+    local game = {GetService = function() return {SetTimeout = function() end} end}
+    local getreg = function() return {self, gameThread, oldHeartbeat, ownFunction, gameFunction} end
+    local getallthreads, getgc = getreg, getreg
+    local debug = {traceback = debug.traceback}
+    local isexecutorclosure = function(f) return f == ownFunction end
+    local hookfunction = function(f) assert(f == gameFunction); hooked = true end
+    local collected = false
+    if mode ~= "no-hook" then
+        OPTIONS.BeforeSave = function()
+            assert(coroutine.status(gameThread) == "dead", "Client threads must stop before preparation")
+            assert(coroutine.status(oldHeartbeat) == "dead", "The sweep also stops the prior heartbeat")
+            newHeartbeat = coroutine.create(function() end)
+            if mode == "error" then error("preparation failed") end
+        end
+    end
+    local function save_game()
+        assert(hooked, "Client functions must be stopped before collection")
+        if mode ~= "no-hook" then assert(newHeartbeat) end
+        collected = true
+    end
+]] .. quiesce .. "\n" .. capture .. [[
+    return ok, err, collected
+end
+]]))()
+for _, mode in {"ok", "no-hook"} do
+    local ok, err, collected = snapshot(mode)
+    assert(ok and collected, tostring(err))
+end
+local ok, err, collected = snapshot("error")
+assert(not ok and not collected and err:find("preparation failed", 1, true))
+print("PASS: merged syntax, Tags fallback, bytecode routing/ZIP, stop-before-prepare ordering, heartbeat restart, preparation failure")

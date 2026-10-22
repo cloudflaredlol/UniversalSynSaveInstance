@@ -20,8 +20,16 @@ This fork includes upstream USSI changes through `a78cc2d` (2026-10-22) and keep
 `DumpBytecode` / `DumpBytecodeZip` for rebuilding scripts outside the game.
 Bytecode dumps skip source-asset recovery and in-game decompilation. Tags use
 the existing public CollectionService serializer before native hidden-property
-reads, avoiding Delta stalls while preserving tag data. Both script entry
+reads, preserving tag data without that native getter. Both script entry
 points contain the same implementation.
+
+For snapshots that interfere with running client scripts, use `KillAllScripts =
+true`. `BeforeSave = function() ... end` runs after those scripts are stopped and
+initialization finishes, before instance collection. This lets automation
+restart its heartbeat and prepare GUI/tool contents without competing with live
+game scripts. A completed attempt returns `true` on success or `false, error` on
+failure; early exits return no success value. Check the return value before
+uploading an existing output path.
 
 Run the local regression checks with `lune run Tests/runtime-regression.luau`.
 They require no Roblox connection or Studio.
