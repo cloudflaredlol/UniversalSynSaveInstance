@@ -1,20 +1,30 @@
 > [!IMPORTANT]
 > Independent, unofficial project. Not affiliated with, endorsed by, or officially connected to Roblox Corporation. "Luau" is a trademark of Roblox Corporation.
 <p align="center">
-  <img height="400px" style="margin: 0; padding: 0" src=".moonwave\static\logo.png" />
+  <img height="300px" style="margin: 0; padding: 0" src=".moonwave\static\logo.png" />
 </p>
 
 # Loadstring
 
 ```lua
 local Params = {
- RepoURL = "https://raw.githubusercontent.com/luau/UniversalSynSaveInstance/main/",
+ RepoURL = "https://raw.githubusercontent.com/cloudflaredlol/UniversalSynSaveInstance/main/",
  SSI = "saveinstance",
 }
 local synsaveinstance = loadstring(game:HttpGet(Params.RepoURL .. Params.SSI .. ".luau", true), Params.SSI)()
-local Options = {} -- Documentation here https://luau.github.io/UniversalSynSaveInstance/api/SynSaveInstance
+local Options = {} -- Documentation here https://luau.github.io/UniversalSynSaveInstance/api/UniversalSynSaveInstance
 synsaveinstance(Options)
 ```
+
+This fork includes upstream USSI changes through `a78cc2d` (2026-10-22) and keeps
+`DumpBytecode` / `DumpBytecodeZip` for rebuilding scripts outside the game.
+Bytecode dumps skip source-asset recovery and in-game decompilation. Tags use
+the existing public CollectionService serializer before native hidden-property
+reads, avoiding Delta stalls while preserving tag data. Both script entry
+points contain the same implementation.
+
+Run the local regression checks with `lune run Tests/runtime-regression.luau`.
+They require no Roblox connection or Studio.
 
 # Universal Syn Save Instance
 
@@ -114,7 +124,7 @@ resources include:
 
 \*\*\* View source code of this file for more credits
 
-[Documentation]: https://luau.github.io/UniversalSynSaveInstance/api/SynSaveInstance
+[Documentation]: https://luau.github.io/UniversalSynSaveInstance/api/UniversalSynSaveInstance
 [@Acrillis]: https://github.com/Acrillis
 [@Anaminus]: https://github.com/Anaminus
 [@Dekkonot]: https://github.com/Dekkonot
