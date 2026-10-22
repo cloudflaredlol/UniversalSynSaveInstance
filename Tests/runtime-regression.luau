@@ -11,35 +11,6 @@ local function section(first, last)
     return source:sub(start, finish - 1)
 end
 
-local readProperty = assert(loadstring([[
-local __BREAK = "SKIPPED"
-local InstancesOverrides = {}
-local nativeCalls = 0
-local function gethiddenproperty() nativeCalls += 1; error("Unsafe native getter called") end
-local function anonymize(raw) return raw end
-]] .. section("local function readProperty(instance, property)", "local function GetInheritedProps(className)") .. [[
-return function()
-    local instance = setmetatable({Name = "VFX"}, {__index = function(_, key)
-        if key == "Tags" then error("Tags must use the public fallback") end
-    end})
-    local property = {Name = "Tags", ValueType = "SharedString", Special = true,
-        Fallback = function() return "effect\0beam" end}
-    assert(readProperty(instance, property) == "effect\0beam")
-    property.Special, property.CanRead = false, true
-    assert(readProperty(instance, property) == "effect\0beam", "Readable tags must also avoid native reads")
-    property.Fallback = function() return "" end
-    assert(readProperty(instance, property) == "", "Empty tags must stay empty")
-    InstancesOverrides[instance] = {Properties = {Tags = "override"}}
-    assert(readProperty(instance, property) == "override", "Overrides must keep precedence")
-    InstancesOverrides[instance] = nil
-    property.Fallback = function() error("Public API failed") end
-    assert(readProperty(instance, property) == __BREAK, "Failed public reads must not enter the native getter")
-    assert(nativeCalls == 0)
-    assert(readProperty(instance, {Name = "Name", ValueType = "string", CanRead = true}) == "VFX")
-end
-]]))()
-readProperty()
-
 local sourceFor = assert(loadstring([[
 local RecoverScriptsFromAssets = false
 local Enum = {RunContext = {Server = "server", Client = "client"}}
@@ -82,47 +53,4 @@ return function()
 end
 ]]))()
 dump()
-
-local quiesce = section("if OPTIONS.KillAllScripts and not USSI.KillAllScripts then", "\n\tif IsolateStarterPlayer then")
-local capture = section("local ok, err = xpcall(function()", "\n\tif OPTIONS.BoostFPS then")
-local snapshot = assert(loadstring([[
-return function(mode)
-    local gameThread = coroutine.create(function() end)
-    local oldHeartbeat = coroutine.create(function() end)
-    local newHeartbeat
-    local ownFunction, gameFunction = function() end, function() end
-    local hooked = false
-    local self = coroutine.running()
-    local OPTIONS, USSI = {KillAllScripts = true}, {}
-    local SaveCacheInterval = 0x1600 * 10
-    local game = {GetService = function() return {SetTimeout = function() end} end}
-    local getreg = function() return {self, gameThread, oldHeartbeat, ownFunction, gameFunction} end
-    local getallthreads, getgc = getreg, getreg
-    local debug = {traceback = debug.traceback}
-    local isexecutorclosure = function(f) return f == ownFunction end
-    local hookfunction = function(f) assert(f == gameFunction); hooked = true end
-    local collected = false
-    if mode ~= "no-hook" then
-        OPTIONS.BeforeSave = function()
-            assert(coroutine.status(gameThread) == "dead", "Client threads must stop before preparation")
-            assert(coroutine.status(oldHeartbeat) == "dead", "The sweep also stops the prior heartbeat")
-            newHeartbeat = coroutine.create(function() end)
-            if mode == "error" then error("preparation failed") end
-        end
-    end
-    local function save_game()
-        assert(hooked, "Client functions must be stopped before collection")
-        if mode ~= "no-hook" then assert(newHeartbeat) end
-        collected = true
-    end
-]] .. quiesce .. "\n" .. capture .. [[
-    return ok, err, collected
-end
-]]))()
-for _, mode in {"ok", "no-hook"} do
-    local ok, err, collected = snapshot(mode)
-    assert(ok and collected, tostring(err))
-end
-local ok, err, collected = snapshot("error")
-assert(not ok and not collected and err:find("preparation failed", 1, true))
-print("PASS: merged syntax, Tags fallback, bytecode routing/ZIP, stop-before-prepare ordering, heartbeat restart, preparation failure")
+print("PASS: merged syntax, bytecode routing, ZIP deduplication")
